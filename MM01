@@ -401,8 +401,8 @@ private void ensureConnected() throws Exception {
 private void writeOutputRow(Object[] r, String msg, boolean success)
         throws KettleException {
     Object[] rOut = createOutputRow(r, data.outputRowMeta.size());
-    get(Fields.Out, "TaskResult").setValue(rOut,  msg);
-    get(Fields.Out, "TaskSuccess").setValue(rOut, success);
+    get(Fields.Out, "TaskInfo").setValue(rOut,  msg);
+    //get(Fields.Out, "TaskSuccess").setValue(rOut, success);
     putRow(data.outputRowMeta, rOut);
 }
 
