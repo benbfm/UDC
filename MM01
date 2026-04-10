@@ -1,0 +1,434 @@
+//*
+input Template:
+ExtID	TaskInfo	IND_SECTOR	MATL_TYPE	Material	PLANT	MATL_DESC_EN	MATL_DESC_ZH	STGE_LOC	STGE_BIN	QTY_GR_GI	LABEL_TYPE	LABEL_FORM	ISS_ST_LOC	BASE_UOM	MATL_GROUP	CLASSTYPE	CLASSNUM	VALUE_CHAR	AUTO_P_ORD	SOURCELIST	PUR_VALKEY	LOTSIZEKEY	PROC_TYPE	PUR_GROUP	TAX_IND	QUOTAUSAGE	MRP_TYPE	MRP_CTRLER	MRP_GROUP	SM_KEY	PLND_DELRY	REPLENTIME	GR_PR_TIME	SAFETY_STK	PROFIT_CTR	PRICE_CTRL	PRICE_UNIT	VAL_CLASS	
+*//
+/*
+  ERSA Material Auto-Creation - Kettle User Defined Java Class (UDC)
+  ===================================================================
+  Purpose  : Automatically create or extend SAP material master (MM01/MM02)
+             and assign classification values for ERSA spare parts.
+  System   : SAP ECA (Dongguan Plant / SNO)
+  Author   : lu.b@duracell.com
+  Date     : Apr 2023
+  Platform : Pentaho PDI 9.4 / SAP JCo 3.x
+
+  Input Fields Required (from Excel Input step):
+    ExtID, TaskInfo, Material, PLANT, IND_SECTOR, MATL_TYPE,
+    MATL_GROUP, BASE_UOM, PUR_VALKEY, QTY_GR_GI, LABEL_TYPE, LABEL_FORM,
+    MATL_DESC_EN, MATL_DESC_ZH, PUR_GROUP, MRP_TYPE, MRP_CTRLER, PLND_DELRY,
+    GR_PR_TIME, LOTSIZEKEY, PROC_TYPE, SAFETY_STK, SM_KEY, REPLENTIME,
+    QUOTAUSAGE, SOURCELIST, PROFIT_CTR, ISS_ST_LOC, MRP_GROUP, AUTO_P_ORD,
+    STGE_LOC, STGE_BIN, PRICE_CTRL, PRICE_UNIT, VAL_CLASS, TAX_IND,
+    CLASSNUM, CLASSTYPE, ATNAM, VALUE_CHAR
+
+  Output Fields Added:
+    TaskResult  (String)  - status message with prefix and timestamp
+    TaskSuccess (Boolean) - true when all BAPI calls succeed
+
+  Task Prefixes in TaskResult:
+    MM01NS  - New material created and class value assigned successfully
+    MM04S   - Existing material extended successfully
+    MM01NE  - Error during new material creation (BAPI_MATERIAL_SAVEDATA)
+    MM01PE  - Error during material extension
+    MM01NC  - Error during classification assignment (BAPI_OBJCL_CHANGE)
+    ERROR   - Unexpected exception
+
+  Prerequisites:
+    1. sapjco3.jar and sapjco3.dll placed in PDI-HOME/lib/
+    2. ECA.jcoDestinations file placed in PDI-HOME/data-integration/
+    3. JVM arg -Djco.destinations.dir=PDI-HOME/data-integration in Spoon.bat
+
+  S/4HANA Compatibility Note:
+    Tested on ECC EHP8. Compatible with S/4HANA on-premise (brownfield).
+    Material number padded to 40 chars to support S/4HANA field length extension.
+*/
+
+/* SAP JCo destination - initialised once per transformation run via ensureConnected() */
+private com.sap.conn.jco.JCoDestination sap = null;
+
+/*
+  init() - called once when the PDI step starts.
+  Delegates to the parent TransformClassBase initialisation.
+*/
+public boolean init( StepMetaInterface stepMetaInterface,
+                     StepDataInterface stepDataInterface ) {
+    return parent.initImpl( stepMetaInterface, stepDataInterface );
+}
+
+/*
+  processRow() - called once per input row by the PDI engine.
+  Main logic:
+    1. Read fields from the incoming row
+    2. Validate TaskInfo is not empty
+    3. Open a stateful JCo context (ensures all BAPIs share one LUW)
+    4. Build and execute BAPI_MATERIAL_SAVEDATA
+    5. On success: commit, then assign classification via BAPI_OBJCL_CHANGE
+    6. Write TaskResult and TaskSuccess to the output row
+    7. Always close the JCo context in the finally block
+*/
+public boolean processRow( StepMetaInterface smi,
+                           StepDataInterface sdi ) throws KettleException {
+
+    Object[] r = getRow();
+    if (r == null) {
+        setOutputDone();
+        return false;
+    }
+
+    /* Read key fields from the input row */
+    String extID    = safeGet(r, "ExtID");
+    String taskInfo = safeGet(r, "TaskInfo");
+    String sku      = safeGet(r, "Material");
+    String werks    = safeGet(r, "PLANT");
+
+    /* Guard: skip rows with no task information */
+    if (taskInfo.length() == 0) {
+        logError("TaskInfo is empty for material: " + sku);
+        writeOutputRow(r, "ERROR:TaskInfo empty;" + nowString(), false);
+        return true;
+    }
+
+    /* Pad material number to 40 chars (S/4HANA supports up to 40-char MATNR) */
+    String matnr = sku.trim();
+    while (matnr.length() < 40) { matnr = "0" + matnr; }
+
+    /* Determine task type: MM01N prefix = create new material, else extend */
+    boolean isNewMaterial = taskInfo.startsWith("MM01N");
+
+    /* Open SAP connection and begin a stateful JCo context (single LUW) */
+    try {
+        ensureConnected();
+        com.sap.conn.jco.JCoContext.begin(sap);
+    } catch (Exception e) {
+        sap = null;
+        logError("SAP connection failed: " + e.getMessage());
+        writeOutputRow(r, "ERROR:SAP connection failed;" + nowString(), false);
+        return true;
+    }
+
+    String rtvMsg = "";
+
+    try {
+
+        /* ----------------------------------------------------------------
+           STEP 1: Build and execute BAPI_MATERIAL_SAVEDATA
+           Creates a new material or extends an existing one to a new plant.
+           ---------------------------------------------------------------- */
+        com.sap.conn.jco.JCoFunction bapi = sap.getRepository()
+                                               .getFunction("BAPI_MATERIAL_SAVEDATA");
+        if (bapi == null)
+            throw new RuntimeException("BAPI_MATERIAL_SAVEDATA not found");
+
+        /* HEADDATA: material number, type, sector, and view flags */
+        com.sap.conn.jco.JCoStructure headData = bapi.getImportParameterList()
+                                    .getStructure("HEADDATA");
+        headData.setValue("MATERIAL",      matnr);
+        headData.setValue("IND_SECTOR",    safeGet(r, "IND_SECTOR"));
+        headData.setValue("MATL_TYPE",     safeGet(r, "MATL_TYPE"));
+        headData.setValue("BASIC_VIEW",    isNewMaterial ? "X" : "");
+        headData.setValue("PURCHASE_VIEW", "X");
+        headData.setValue("MRP_VIEW",      "X");
+        headData.setValue("STORAGE_VIEW",  "X");
+        headData.setValue("ACCOUNT_VIEW",  "X");
+
+        /* CLIENTDATA / CLIENTDATAX: client-level fields, only for new material */
+        if (isNewMaterial) {
+            com.sap.conn.jco.JCoStructure clientData  = bapi.getImportParameterList()
+                                           .getStructure("CLIENTDATA");
+            com.sap.conn.jco.JCoStructure clientDataX = bapi.getImportParameterList()
+                                           .getStructure("CLIENTDATAX");
+            /* X flags tell the BAPI which fields to update */
+            clientDataX.setValue("MATL_GROUP", "X");
+            clientDataX.setValue("BASE_UOM",   "X");
+            clientDataX.setValue("PUR_VALKEY", "X");
+            clientDataX.setValue("QTY_GR_GI",  "X");
+            clientDataX.setValue("LABEL_TYPE", "X");
+            clientDataX.setValue("LABEL_FORM", "X");
+            clientData.setValue("MATL_GROUP",  safeGet(r, "MATL_GROUP"));
+            clientData.setValue("BASE_UOM",    safeGet(r, "BASE_UOM"));
+            clientData.setValue("PUR_VALKEY",  safeGet(r, "PUR_VALKEY"));
+            clientData.setValue("QTY_GR_GI",   safeGet(r, "QTY_GR_GI"));
+            clientData.setValue("LABEL_TYPE",  safeGet(r, "LABEL_TYPE"));
+            clientData.setValue("LABEL_FORM",  safeGet(r, "LABEL_FORM"));
+        }
+
+        /* PLANTDATA / PLANTDATAX: MRP, purchasing, and storage settings per plant */
+        com.sap.conn.jco.JCoStructure plantData  = bapi.getImportParameterList()
+                                      .getStructure("PLANTDATA");
+        com.sap.conn.jco.JCoStructure plantDataX = bapi.getImportParameterList()
+                                      .getStructure("PLANTDATAX");
+        plantDataX.setValue("PLANT",      werks);
+        plantDataX.setValue("PUR_GROUP",  "X");
+        plantDataX.setValue("MRP_TYPE",   "X");
+        plantDataX.setValue("MRP_CTRLER", "X");
+        plantDataX.setValue("PLND_DELRY", "X");
+        plantDataX.setValue("GR_PR_TIME", "X");
+        plantDataX.setValue("LOTSIZEKEY", "X");
+        plantDataX.setValue("PROC_TYPE",  "X");
+        plantDataX.setValue("SAFETY_STK", "X");
+        plantDataX.setValue("SM_KEY",     "X");
+        plantDataX.setValue("REPLENTIME", "X");
+        plantDataX.setValue("QUOTAUSAGE", "X");
+        plantDataX.setValue("SOURCELIST", "X");
+        plantDataX.setValue("PROFIT_CTR", "X");
+        plantDataX.setValue("ISS_ST_LOC", "X");
+        plantDataX.setValue("SLOC_EXPRC", "X");
+        plantDataX.setValue("MRP_GROUP",  "X");
+        plantDataX.setValue("AVAILCHECK", "X");
+        plantDataX.setValue("AUTO_P_ORD", "X");
+        plantData.setValue("PLANT",      werks);
+        plantData.setValue("PUR_GROUP",  safeGet(r, "PUR_GROUP"));
+        plantData.setValue("MRP_TYPE",   safeGet(r, "MRP_TYPE"));
+        plantData.setValue("MRP_CTRLER", safeGet(r, "MRP_CTRLER"));
+        plantData.setValue("PLND_DELRY", safeGet(r, "PLND_DELRY"));
+        plantData.setValue("GR_PR_TIME", safeGet(r, "GR_PR_TIME"));
+        plantData.setValue("LOTSIZEKEY", safeGet(r, "LOTSIZEKEY"));
+        plantData.setValue("PROC_TYPE",  safeGet(r, "PROC_TYPE"));
+        plantData.setValue("SAFETY_STK", safeGet(r, "SAFETY_STK"));
+        plantData.setValue("SM_KEY",     safeGet(r, "SM_KEY"));
+        plantData.setValue("REPLENTIME", safeGet(r, "REPLENTIME"));
+        plantData.setValue("QUOTAUSAGE", safeGet(r, "QUOTAUSAGE"));
+        /* SOURCELIST: set X only when field value is non-empty */
+        plantData.setValue("SOURCELIST", isNotEmpty(r, "SOURCELIST") ? "X" : "");
+        plantData.setValue("PROFIT_CTR", safeGet(r, "PROFIT_CTR"));
+        plantData.setValue("ISS_ST_LOC", safeGet(r, "ISS_ST_LOC"));
+        /* SLOC_EXPRC mirrors ISS_ST_LOC as per original VBS design */
+        plantData.setValue("SLOC_EXPRC", safeGet(r, "ISS_ST_LOC"));
+        plantData.setValue("MRP_GROUP",  safeGet(r, "MRP_GROUP"));
+        plantData.setValue("AVAILCHECK", "02");
+        /* AUTO_P_ORD: set X only when field value is non-empty */
+        plantData.setValue("AUTO_P_ORD", isNotEmpty(r, "AUTO_P_ORD") ? "X" : "");
+
+        /* STORAGELOCATIONDATA: bin and storage location assignment */
+        com.sap.conn.jco.JCoStructure slData  = bapi.getImportParameterList()
+                                   .getStructure("STORAGELOCATIONDATA");
+        com.sap.conn.jco.JCoStructure slDataX = bapi.getImportParameterList()
+                                   .getStructure("STORAGELOCATIONDATAX");
+        slDataX.setValue("PLANT",    werks);
+        slDataX.setValue("STGE_LOC", safeGet(r, "STGE_LOC"));
+        slDataX.setValue("STGE_BIN", "X");
+        slData.setValue("PLANT",     werks);
+        slData.setValue("STGE_LOC",  safeGet(r, "STGE_LOC"));
+        slData.setValue("STGE_BIN",  safeGet(r, "STGE_BIN"));
+
+        /* VALUATIONDATA: accounting/valuation settings */
+        com.sap.conn.jco.JCoStructure valData  = bapi.getImportParameterList()
+                                    .getStructure("VALUATIONDATA");
+        com.sap.conn.jco.JCoStructure valDataX = bapi.getImportParameterList()
+                                    .getStructure("VALUATIONDATAX");
+        valDataX.setValue("VAL_AREA",   werks);
+        valDataX.setValue("PRICE_CTRL", "X");
+        valDataX.setValue("PRICE_UNIT", "X");
+        valDataX.setValue("VAL_CLASS",  "X");
+        valData.setValue("VAL_AREA",    werks);
+        valData.setValue("PRICE_CTRL",  safeGet(r, "PRICE_CTRL"));
+        valData.setValue("PRICE_UNIT",  safeGet(r, "PRICE_UNIT"));
+        valData.setValue("VAL_CLASS",   safeGet(r, "VAL_CLASS"));
+
+        /* MATERIALDESCRIPTION: EN description for new materials; ZH always */
+        com.sap.conn.jco.JCoTable matDesc = bapi.getTableParameterList()
+                               .getTable("MATERIALDESCRIPTION");
+        matDesc.clear();
+        String descEn = safeGet(r, "MATL_DESC_EN");
+        if (isNewMaterial && descEn.length() > 0) {
+            matDesc.appendRow();
+            matDesc.setValue("LANGU",     "EN");
+            matDesc.setValue("MATL_DESC", descEn);
+        }
+        String descZh = safeGet(r, "MATL_DESC_ZH");
+        if (descZh.length() > 0) {
+            matDesc.appendRow();
+            matDesc.setValue("LANGU",     "1");
+            matDesc.setValue("MATL_DESC", descZh);
+        }
+
+        /* TAXCLASSIFICATIONS: CN tax indicator - set only when TAX_IND = 1 */
+        com.sap.conn.jco.JCoTable taxClass = bapi.getTableParameterList()
+                                .getTable("TAXCLASSIFICATIONS");
+        taxClass.clear();
+        String taxInd = safeGet(r, "TAX_IND");
+        if ("1".equals(taxInd) || "1.0".equals(taxInd)) {
+            taxClass.appendRow();
+            taxClass.setValue("DEPCOUNTRY", "CN");
+            taxClass.setValue("TAX_IND",    "1");
+        }
+
+        /* Execute BAPI_MATERIAL_SAVEDATA */
+        bapi.execute(sap);
+
+        /* Check RETURN: E=Error, A=Abort -> log and skip to next row */
+        com.sap.conn.jco.JCoStructure ret = bapi.getExportParameterList()
+                               .getStructure("RETURN");
+        String retType    = ret.getString("TYPE");
+        String retMessage = ret.getString("MESSAGE");
+
+        if ("E".equalsIgnoreCase(retType) || "A".equalsIgnoreCase(retType)) {
+            String prefix = isNewMaterial ? "MM01NE:" : "MM01PE:";
+            rtvMsg = prefix + retType + "/" + retMessage + ";" + nowString();
+            logError("Material BAPI error - " + rtvMsg);
+            writeOutputRow(r, rtvMsg, false);
+            return true;
+        }
+
+        /* ----------------------------------------------------------------
+           STEP 2: Commit BAPI_MATERIAL_SAVEDATA
+           WAIT=X ensures SAP fully persists the material before the next
+           BAPI call attempts to access it.
+           ---------------------------------------------------------------- */
+        com.sap.conn.jco.JCoFunction commit = sap.getRepository()
+                                                  .getFunction("BAPI_TRANSACTION_COMMIT");
+        commit.getImportParameterList().setValue("WAIT", "X");
+        commit.execute(sap);
+
+        /* ----------------------------------------------------------------
+           STEP 3 (new material only): Assign classification value
+           Uses BAPI_OBJCL_CHANGE to set the characteristic value under the
+           specified class. The commit object is prepared BEFORE executing
+           the BAPI to ensure it is ready in the same LUW.
+           ---------------------------------------------------------------- */
+        if (isNewMaterial) {
+            String classNum  = safeGet(r, "CLASSNUM");
+            String classType = safeGet(r, "CLASSTYPE");
+            String atnam     = safeGet(r, "ATNAM");
+            String valChar   = safeGet(r, "VALUE_CHAR");
+
+            /* Default class type to Z02 if not provided in input */
+            if (classType.length() == 0) {
+                classType = "Z02";
+            }
+
+            com.sap.conn.jco.JCoFunction setCV = sap.getRepository()
+                                                     .getFunction("BAPI_OBJCL_CHANGE");
+            if (setCV == null)
+                throw new RuntimeException("BAPI_OBJCL_CHANGE not found");
+
+            /* Prepare commit object before BAPI call (required for LUW consistency) */
+            com.sap.conn.jco.JCoFunction commit2 = sap.getRepository()
+                                                       .getFunction("BAPI_TRANSACTION_COMMIT");
+            commit2.getImportParameterList().setValue("WAIT", "X");
+
+            /* Set classification header: object key, table, class, and type */
+            setCV.getImportParameterList().setValue("OBJECTKEY",   matnr);
+            setCV.getImportParameterList().setValue("OBJECTTABLE", "MARA");
+            setCV.getImportParameterList().setValue("CLASSNUM",    classNum);
+            setCV.getImportParameterList().setValue("CLASSTYPE",   classType);
+
+            /* ALLOCVALUESCHARNEW: characteristic value assignment table */
+            com.sap.conn.jco.JCoTable cv = setCV.getTableParameterList()
+                               .getTable("ALLOCVALUESCHARNEW");
+            cv.clear();
+            cv.appendRow();
+            cv.setValue("CHARACT",       atnam);
+            cv.setValue("VALUE_CHAR",    valChar);
+            cv.setValue("VALUE_NEUTRAL", valChar);
+            cv.setValue("CHARACT_DESCR", classNum);
+
+            /* Execute BAPI_OBJCL_CHANGE */
+            setCV.execute(sap);
+
+            /* Check RETURN table: scan all rows for E or A type messages */
+            com.sap.conn.jco.JCoTable cvRet = setCV.getTableParameterList()
+                                   .getTable("RETURN");
+            String cvType = "";
+            String cvMsg  = "";
+            for (int i = 0; i < cvRet.getNumRows(); i++) {
+                cvRet.setRow(i);
+                String t = cvRet.getString("TYPE");
+                String m = cvRet.getString("MESSAGE");
+                if ("E".equalsIgnoreCase(t) || "A".equalsIgnoreCase(t)) {
+                    cvType = t;
+                    cvMsg  = m;
+                }
+            }
+
+            /* If classification failed, log error and skip commit */
+            if ("E".equalsIgnoreCase(cvType) || "A".equalsIgnoreCase(cvType)) {
+                rtvMsg = "MM01NC:" + cvType + "/" + cvMsg + ";" + nowString();
+                logError("Class assign error - " + rtvMsg);
+                writeOutputRow(r, rtvMsg, false);
+                return true;
+            }
+
+            /* Commit the classification assignment */
+            commit2.execute(sap);
+
+            rtvMsg = "MM01NS:S/Material " + matnr + " created and class assigned;"
+                   + nowString();
+            writeOutputRow(r, rtvMsg, true);
+            return true;
+
+        } else {
+            /* Extension path: no classification step needed */
+            rtvMsg = "MM04S:S/Material " + matnr + " extended;" + nowString();
+        }
+
+    } catch (Exception e) {
+        rtvMsg = "ERROR:" + e.getMessage() + ";" + nowString();
+        logError("Row " + extID + " - " + e.getMessage());
+    } finally {
+        /* Always end the JCo stateful context to release the RFC connection */
+        if (sap != null) {
+            try {
+                com.sap.conn.jco.JCoContext.end(sap);
+            } catch (Exception ex) {
+                logError("JCoContext.end failed: " + ex.getMessage());
+            }
+        }
+    }
+
+    /* Write final output row for the extension path or catch-block errors */
+    boolean finalSuccess = rtvMsg.length() > 0 && !rtvMsg.startsWith("ERROR");
+    writeOutputRow(r, rtvMsg, finalSuccess);
+    return true;
+}
+
+/*
+  ensureConnected() - lazy initialisation of the SAP JCo destination.
+  Creates the destination only once per transformation run.
+  Resets sap to null on connection failure so the next row retries.
+  Reads connection properties from ECA.jcoDestinations file in
+  the directory specified by -Djco.destinations.dir JVM argument.
+*/
+private void ensureConnected() throws Exception {
+    if (sap == null) {
+        sap = com.sap.conn.jco.JCoDestinationManager.getDestination("ECA");
+    }
+}
+
+/*
+  writeOutputRow() - writes TaskResult and TaskSuccess to the output stream.
+  Creates a resized copy of the input row to accommodate the two new fields.
+*/
+private void writeOutputRow(Object[] r, String msg, boolean success)
+        throws KettleException {
+    Object[] rOut = createOutputRow(r, data.outputRowMeta.size());
+    get(Fields.Out, "TaskResult").setValue(rOut,  msg);
+    get(Fields.Out, "TaskSuccess").setValue(rOut, success);
+    putRow(data.outputRowMeta, rOut);
+}
+
+/*
+  safeGet() - null-safe field reader.
+  Returns trimmed string value, or empty string if the field is null.
+*/
+private String safeGet(Object[] r, String field) throws KettleException {
+    String val = get(Fields.In, field).getString(r);
+    return (val != null) ? val.trim() : "";
+}
+
+/*
+  isNotEmpty() - convenience helper.
+  Returns true when the named field contains a non-empty value.
+*/
+private boolean isNotEmpty(Object[] r, String field) throws KettleException {
+    return safeGet(r, field).length() > 0;
+}
+
+/*
+  nowString() - returns the current timestamp as a formatted string.
+  Used as a suffix in all TaskResult messages for traceability.
+*/
+private String nowString() {
+    return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+               .format(new java.util.Date());
+}
