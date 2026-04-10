@@ -8,7 +8,6 @@ ExtID	TaskInfo	IND_SECTOR	MATL_TYPE	Material	PLANT	MATL_DESC_EN	MATL_DESC_ZH	STG
   Purpose  : Automatically create or extend SAP material master (MM01/MM02)
              and assign classification values for ERSA spare parts.
   System   : SAP ECA (Dongguan Plant / SNO)
-  Author   : lu.b@duracell.com
   Date     : Apr 2023
   Platform : Pentaho PDI 9.4 / SAP JCo 3.x
 
